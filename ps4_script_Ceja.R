@@ -118,7 +118,30 @@ forecast::dm.test(liquor_errs$arima, liquor_errs$snaive, h = 1, power = 2)
 # RMSE and MAE. It also performs better than both the ETS model and seasonal 
 # random walk benchmark.
 
+# Part 3 - Forecast Combination
 
+# 3a.
+liquor_combo_fc <- liquor_cv_fit |>
+  mutate(combo = (arima + ets) / 2) |>
+  forecast(h = 1)
+
+combo_acc_results <- liquor_combo_fc |>
+  accuracy(liquor, measures = list(RMSE = RMSE, MAE = MAE))
+
+combo_acc_results |>
+  knitr::kable(digits = 2)
+# The ARIMA model performed the best with the lowest RMSE(81.43) and MAE(65.65).
+# The forecast combination performed better than ETS and SNAIVE with a 
+# RMSE = 85.19 and a MAE = 66.77. The forecast combination did improve accuracy
+# relative to the weaker models, but it slightly reduced the the performance of 
+# the ARIMA model.
+
+# 3b.
+cor(liquor_errs$arima, liquor_errs$ets)
+# Based on the correlation (0.8782931), the ARIMA and ETS forecast errors are
+# highly correlated. Because of this, combining the models provides little
+# additional benefit. Which is why it was not able to outperform the ARIMA
+# model, the best performing model.
 
 
 
