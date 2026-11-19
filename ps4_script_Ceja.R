@@ -81,6 +81,7 @@ liquor_cv_fit <- liquor_cv |>
         arima  = ARIMA(log(sales)))
 
 saveRDS(liquor_cv_fit, "results/liquor_cv_fit.rds")
+liquor_cv_fit <- readRDS("results/liquor_cv_fit.rds")
 # The TS-CV considers 216 forecast origins.
 
 # 2.3b.
@@ -143,5 +144,130 @@ cor(liquor_errs$arima, liquor_errs$ets)
 # additional benefit. Which is why it was not able to outperform the ARIMA
 # model, the best performing model.
 
+# Part 4 - A Medium-Scale VAR vs. a BAR
 
+# 4.1a,
+qd_raw <- read_csv("data/fredqd_2026-09.csv", show_col_types = FALSE) |>
+  slice(-(1:2))
+
+# 4.1b.
+growth <- function(x) 100 * difference(log(x))
+
+qd <- qd_raw |>
+  mutate(date = as.Date(sasdate, "%m/%d/%Y")) |>
+  transmute(date,
+            gdp    = growth(GDPC1),     # real GDP
+            cons   = growth(PCECC96),   # real consumption
+            inv    = growth(GPDIC1),    # real investment
+            emp    = growth(PAYEMS),    # payroll employment
+            infl   = growth(GDPCTPI),   # GDP price index
+            unrate = difference(UNRATE),     # unemployment rate
+            ffr    = difference(FEDFUNDS),   # federal funds rate
+            gs10   = difference(GS10)) |>    # 10-year Treasury yield
+  filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+
+y <- qd |> select(-date) |> as.matrix()
+
+nrow(y)
+head(y)
+
+# 4.1c.
+N <- nrow(y)
+origins <- 120:(N - 1)
+actual <- y[121:N, ]
+# We will produce N - 120 forecasts for each variable. The first forecast is for
+# 1990 Q1 and the last forecast is in the final quarter of the dataset.
+
+# 4.2
+var_ols_fc <- function(z, p) {
+  e <- embed(z, p + 1)            # columns: y_t, then its lags 1 to p
+  M <- ncol(z)                    # number of variables
+  B <- coef(lm(e[, 1:M] ~ e[, -(1:M)]))
+  x <- c(1, t(z[nrow(z):(nrow(z) - p + 1), ]))   # constant, latest p lags
+  x %*% B
+}
+
+fc_var1 <- NULL
+fc_var4 <- NULL
+for (T in origins) {
+  fc_var1 <- rbind(fc_var1, var_ols_fc(y[1:T, ], 1))
+  fc_var4 <- rbind(fc_var4, var_ols_fc(y[1:T, ], 4))
+}
+
+rmse_by_var <- function(f) sqrt(colMeans((actual - f)^2))
+
+rmse_by_var(fc_var1)
+rmse_by_var(fc_var4)
+# VAR(1) forecasts better because it has lower RMSE 7 of the 8 variables, while
+# VAR(4) only forecasts better for inflation. The smaller model forecasts better
+# because VAR(4) having additional parameters appears to be increasing 
+# estimation error and overfitting.
+
+# 4.3a.
+bvar_cv <- function(lambda) {
+  pr <- bv_priors(hyper = "lambda",
+                  mn = bv_mn(lambda = bv_lambda(mode = lambda, sd = 0.4,
+                                                min = 0.999 * lambda,
+                                                max = 1.001 * lambda),
+                             b = 0))
+  fc <- NULL
+  for (T in origins) {
+    fit_T <- bvar(y[1:T, ], lags = 4, priors = pr,
+                  n_draw = 2000, n_burn = 1000, verbose = FALSE)
+    x <- c(1, t(y[T:(T - 3), ]))         # constant and 4 lags of each variable
+    fc <- rbind(fc, x %*% coef(fit_T))   # forecast of y_{T+1}
+  }
+  fc
+}
+
+set.seed(422)
+fc_bvar_03 <- bvar_cv(0.3)
+saveRDS(fc_bvar_03, "results/fc_bvar_03.rds")
+
+# 4.3b.
+set.seed(422)
+fc_bvar_005 <- bvar_cv(0.05)
+
+var_results <- tibble(
+  Variable = colnames(y),
+  `VAR(1)` = rmse_by_var(fc_var1),
+  `VAR(4)` = rmse_by_var(fc_var4),
+  `BVAR(4), lambda = 0.3` = rmse_by_var(fc_bvar_03),
+  `BVAR(4), lambda = 0.05` = rmse_by_var(fc_bvar_005)
+)
+
+saveRDS(var_results, "results/var_results.rds")
+
+var_results |> knitr::kable(digits = 3)
+# The BVAR(4) with lambda = 0.3 does better in all variables compared to the
+# VAR(4) model. Even though they have the same variables and lags, the BVAR(4)
+# model has better accuracy because it reduces estimation error by applying
+# shrinkage.
+
+# Compared to VAR(1), the BVAR(4) with lambda = 0.3 does better in 3 of the 8 
+# variables. It has the lowest RMSE for investment, inflation, and gs10. 
+# Meanwhile, VAR(1) does better for the rest of the variables. 
+
+# When lambda = 0.5, the forecast performs worst. This means that a lower lambda
+# results in less shrinkage, which allows the model to fit the training data
+# better. The winner's RMSE would not really be a fair estimate of how 
+# accurately it will forecast in the future because the data-generating process
+# could change, which can make accuracy worse.
+
+# 4.3c.
+e_var4 <- actual[, "gdp"] - fc_var4[, 1]
+e_bvar <- actual[, "gdp"] - fc_bvar_03[, 1]
+
+forecast::dm.test(e_var4, e_bvar, h = 1, power = 2)
+
+e_var4 <- actual[, "inv"] - fc_var4[, 1]
+e_bvar <- actual[, "inv"] - fc_bvar_03[, 1]
+
+forecast::dm.test(e_var4, e_bvar, h = 1, power = 2)
+# For the GDP variable, the DM test rejects the null hypothesis that the two 
+# models have equal forecast accuracy. For the investment variable, the DM test
+# fails to reject the null hypothesis that the two models have equal forecast.
+# This affects how I think about the results in 4.3b because is shows that lower
+# RMSE values do not necessarily imply a statistically significant improvement 
+# in forecast accuracy. 
 
