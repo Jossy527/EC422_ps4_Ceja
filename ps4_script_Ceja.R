@@ -223,6 +223,7 @@ bvar_cv <- function(lambda) {
 set.seed(422)
 fc_bvar_03 <- bvar_cv(0.3)
 saveRDS(fc_bvar_03, "results/fc_bvar_03.rds")
+fc_bvar_03 <- readRDS("results/fc_bvar_03.rds")
 
 # 4.3b.
 set.seed(422)
@@ -237,6 +238,7 @@ var_results <- tibble(
 )
 
 saveRDS(var_results, "results/var_results.rds")
+var_results <- readRDS("results/var_results.rds")
 
 var_results |> knitr::kable(digits = 3)
 # The BVAR(4) with lambda = 0.3 does better in all variables compared to the
@@ -270,4 +272,123 @@ forecast::dm.test(e_var4, e_bvar, h = 1, power = 2)
 # This affects how I think about the results in 4.3b because is shows that lower
 # RMSE values do not necessarily imply a statistically significant improvement 
 # in forecast accuracy. 
+
+# Part 5 - A Factor Model with FRED-MD
+
+# 5.1a.
+md_raw <- read_csv("data/fredmd_2026-09.csv", show_col_types = FALSE)
+tcode <- unlist(md_raw[1, -1])
+md <- md_raw[-1, ] |> mutate(date = as.Date(sasdate, "%m/%d/%Y"))
+
+transform_series <- function(x, code) {
+  d <- function(v) c(NA, diff(v))
+  switch(as.character(code),
+         "1" = x,                      # level
+         "2" = d(x),                   # first difference
+         "3" = d(d(x)),                # second difference
+         "4" = log(x),                 # log
+         "5" = 100 * d(log(x)),        # growth rate
+         "6" = 100 * d(d(log(x))),     # change in the growth rate
+         "7" = d(x / dplyr::lag(x) - 1))
+}
+
+# 5.1b.
+fm <- map2_dfc(md[names(tcode)], tcode, transform_series) |>
+  mutate(date = md$date, .before = 1) |>
+  filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+
+fm <- fm[, colSums(is.na(fm)) == 0]
+
+dim(fm)
+
+# 5.1c.
+tcode[c("INDPRO", "PAYEMS", "CPIAUCSL", "FEDFUNDS")]
+# INDPRO and PAYEMS are transformed using log first differences, CPIAUCSL is
+# transformed using log second differences, and FEDFUNDS is transformed using
+# a simple first difference. I think the transformation chosen for FEDFUNDS 
+# differs from the one for INDPRO because it is already an interest rate, 
+# meanwhile INDPRO is a trending index.
+
+# 5.2a.
+Z <- fm |> select(-date) |> as.matrix()
+
+pc <- prcomp(scale(Z))
+
+summary(pc)$importance[, 1:5]
+# The first three factors explain 0.149840 + 0.074070 + 0.070620 = 0.29453 or
+# 29.453% of the total variance in the 121 standardized series. 
+
+# 5.2b.
+F1 <- pc$x[, 1] * sign(cor(pc$x[, 1], fm$INDPRO))
+
+tibble(date = fm$date, F1 = F1) |>
+  ggplot(aes(date, F1)) +
+  geom_line() +
+  labs(title = "First Factor from FRED-MD", x = NULL, y = NULL) +
+  theme_minimal()
+
+# 5.2c.
+sort(abs(cor(pc$x[, 1], Z))[1, ], decreasing = TRUE)[1:8]
+sort(abs(cor(pc$x[, 2], Z))[1, ], decreasing = TRUE)[1:8]
+# The first factor is strongly correlated to employment, industrial 
+# production, capacity utilization measures, and declines during recession.
+# Meaning that it represents a business cycle and real economic activity. The 
+# second factor is most strongly correlated to CPI, PCE price indexes, and
+# captures common movements in consumer prices. Meaning that it captures
+# inflation and price movements. 
+
+# 5.3
+ip <- fm$INDPRO
+n <- nrow(Z)
+init <- which(fm$date == as.Date("1989-12-01"))
+
+e_ar <- NULL
+e_fa <- NULL
+for (T in init:(n - 1)) {
+  F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:3]         # factors using data through T
+  d <- data.frame(y_next = ip[2:T], y = ip[1:(T - 1)], F_T[1:(T - 1), ])
+  new <- data.frame(y = ip[T], t(F_T[T, ]))
+  e_ar <- c(e_ar, ip[T + 1] - predict(lm(y_next ~ y, d), new))
+  e_fa <- c(e_fa, ip[T + 1] - predict(lm(y_next ~ ., d), new))
+}
+
+c(RMSE_AR = sqrt(mean(e_ar^2)), RMSE_FA = sqrt(mean(e_fa^2)))
+# The AR(1) model produces an RMSE of 0.6168431 and the one with the factors
+# produces an RMSE of 0.5887272, which closely match the results from class. It
+# would be cheating to estimate the factors once using the full sample because
+# the factors that come from it would use information from future observations
+# that weren't available at the forecast origin.
+
+# 5.4
+direct_race <- function(series, h = 12, r = 3) {
+  lv <- md |>
+    mutate(log_x = log(.data[[series]]),
+           g = 100 * (log_x - lag(log_x))) |>
+    filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+  yh <- 100 * (lead(lv$log_x, h) - lv$log_x)      # growth over the next h months
+  g  <- lv$g                                      # growth over the latest month
+  
+  e_ar <- NULL
+  e_fa <- NULL
+  for (T in init:(n - h)) {
+    F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:r, drop = FALSE]
+    i <- 1:(T - h)
+    d <- data.frame(yh = yh[i], g = g[i], F_T[i, , drop = FALSE])
+    new <- data.frame(g = g[T], F_T[T, , drop = FALSE])
+    e_ar <- c(e_ar, yh[T] - predict(lm(yh ~ g, d), new))
+    e_fa <- c(e_fa, yh[T] - predict(lm(yh ~ ., d), new))
+  }
+  tibble(series, forecasts = length(e_ar),
+         RMSE_AR = sqrt(mean(e_ar^2)), RMSE_FA = sqrt(mean(e_fa^2)),
+         MAE_AR = mean(abs(e_ar)), MAE_FA = mean(abs(e_fa)),
+         DM_pvalue = forecast::dm.test(e_ar, e_fa, h = h, power = 2,
+                                       varestimator = "bartlett")$p.value)
+}
+
+direct_race("CPIAUCSL")
+# The factors improve the forecast of 12-month CPI inflation. The RMSE falls 
+# 2.11 to 1.89, which is a reduction of about 10.4%. The improvement is
+# statistically significant at the 5% level, since the DM test gives a p-value
+# of 0.000443.
+
 
